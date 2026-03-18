@@ -110,3 +110,70 @@ if (!item) {
 ```
 
 The hint ("use search_items…") turns a dead end into a next step.
+
+---
+
+## Tool annotations
+
+Hints the host uses for UX — red confirm button for destructive, auto-approve for readonly. All default to unset (host assumes worst case).
+
+| Annotation | Meaning | Host behavior |
+|---|---|---|
+| `readOnlyHint: true` | No side effects | May auto-approve |
+| `destructiveHint: true` | Deletes/overwrites | Confirmation dialog |
+| `idempotentHint: true` | Safe to retry | May retry on transient error |
+| `openWorldHint: true` | Talks to external world (web, APIs) | May show network indicator |
+
+```typescript
+server.registerTool("delete_file", {
+  description: "Delete a file",
+  inputSchema: { path: z.string() },
+  annotations: { destructiveHint: true, idempotentHint: false },
+}, handler);
+```
+
+```python
+@mcp.tool(annotations={"destructiveHint": True, "idempotentHint": False})
+def delete_file(path: str) -> str:
+    ...
+```
+
+Pair with the read/write split advice in `build-mcpb/references/local-security.md` — mark every read tool `readOnlyHint: true`.
+
+---
+
+## Structured output
+
+`JSON.stringify(result)` in a text block works, but the spec has first-class typed output: `outputSchema` + `structuredContent`. Clients can validate.
+
+```typescript
+server.registerTool("get_weather", {
+  description: "Get current weather",
+  inputSchema: { city: z.string() },
+  outputSchema: { temp: z.number(), conditions: z.string() },
+}, async ({ city }) => {
+  const data = await fetchWeather(city);
+  return {
+    content: [{ type: "text", text: JSON.stringify(data) }],  // backward compat
+    structuredContent: data,                                    // typed output
+  };
+});
+```
+
+Always include the text fallback — not all hosts read `structuredContent` yet.
+
+---
+
+## Content types beyond text
+
+Tools can return more than strings:
+
+| Type | Shape | Use for |
+|---|---|---|
+| `text` | `{ type: "text", text: string }` | Default |
+| `image` | `{ type: "image", data: base64, mimeType }` | Screenshots, charts, diagrams |
+| `audio` | `{ type: "audio", data: base64, mimeType }` | TTS output, recordings |
+| `resource_link` | `{ type: "resource_link", uri, name?, description? }` | Pointer — client fetches later |
+| `resource` (embedded) | `{ type: "resource", resource: { uri, text\|blob, mimeType } }` | Inline the full content |
+
+**`resource_link` vs embedded:** link for large payloads or when the client might not need it (let them decide). Embed when it's small and always needed.

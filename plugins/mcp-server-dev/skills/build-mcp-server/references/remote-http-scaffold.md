@@ -20,20 +20,24 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import express from "express";
 import { z } from "zod";
 
-const server = new McpServer({
-  name: "my-service",
-  version: "0.1.0",
-});
+const server = new McpServer(
+  { name: "my-service", version: "0.1.0" },
+  { instructions: "Prefer search_items before calling get_item directly — IDs aren't guessable." },
+);
 
 // Pattern A: one tool per action
-server.tool(
+server.registerTool(
   "search_items",
-  "Search items by keyword. Returns up to `limit` matches ranked by relevance.",
   {
-    query: z.string().describe("Search keywords"),
-    limit: z.number().int().min(1).max(50).default(10),
+    description: "Search items by keyword. Returns up to `limit` matches ranked by relevance.",
+    inputSchema: {
+      query: z.string().describe("Search keywords"),
+      limit: z.number().int().min(1).max(50).default(10),
+    },
+    annotations: { readOnlyHint: true },
   },
-  async ({ query, limit }) => {
+  async ({ query, limit }, extra) => {
+    // extra.signal is an AbortSignal — check it in long loops for cancellation
     const results = await upstreamApi.search(query, limit);
     return {
       content: [{ type: "text", text: JSON.stringify(results, null, 2) }],
@@ -41,10 +45,13 @@ server.tool(
   },
 );
 
-server.tool(
+server.registerTool(
   "get_item",
-  "Fetch a single item by its ID.",
-  { id: z.string() },
+  {
+    description: "Fetch a single item by its ID.",
+    inputSchema: { id: z.string() },
+    annotations: { readOnlyHint: true },
+  },
   async ({ id }) => {
     const item = await upstreamApi.get(id);
     return { content: [{ type: "text", text: JSON.stringify(item) }] };
@@ -71,7 +78,7 @@ app.listen(process.env.PORT ?? 3000);
 
 ---
 
-## FastMCP 2.0 (Python)
+## FastMCP 3.x (Python)
 
 ```bash
 pip install fastmcp
@@ -82,14 +89,17 @@ pip install fastmcp
 ```python
 from fastmcp import FastMCP
 
-mcp = FastMCP(name="my-service")
+mcp = FastMCP(
+    name="my-service",
+    instructions="Prefer search_items before calling get_item directly — IDs aren't guessable.",
+)
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": True})
 def search_items(query: str, limit: int = 10) -> list[dict]:
     """Search items by keyword. Returns up to `limit` matches ranked by relevance."""
     return upstream_api.search(query, limit)
 
-@mcp.tool
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_item(id: str) -> dict:
     """Fetch a single item by its ID."""
     return upstream_api.get(id)
@@ -109,22 +119,27 @@ When wrapping 50+ endpoints, don't register them all. Two tools:
 ```typescript
 const CATALOG = loadActionCatalog(); // { id, description, paramSchema }[]
 
-server.tool(
+server.registerTool(
   "search_actions",
-  "Find available actions matching an intent. Call this first to discover what's possible. Returns action IDs, descriptions, and parameter schemas.",
-  { intent: z.string().describe("What you want to do, in plain English") },
+  {
+    description: "Find available actions matching an intent. Call this first to discover what's possible. Returns action IDs, descriptions, and parameter schemas.",
+    inputSchema: { intent: z.string().describe("What you want to do, in plain English") },
+    annotations: { readOnlyHint: true },
+  },
   async ({ intent }) => {
     const matches = rankActions(CATALOG, intent).slice(0, 10);
     return { content: [{ type: "text", text: JSON.stringify(matches, null, 2) }] };
   },
 );
 
-server.tool(
+server.registerTool(
   "execute_action",
-  "Execute an action by ID. Get the ID and params schema from search_actions first.",
   {
-    action_id: z.string(),
-    params: z.record(z.unknown()),
+    description: "Execute an action by ID. Get the ID and params schema from search_actions first.",
+    inputSchema: {
+      action_id: z.string(),
+      params: z.record(z.unknown()),
+    },
   },
   async ({ action_id, params }) => {
     const action = CATALOG.find(a => a.id === action_id);
@@ -146,6 +161,9 @@ server.tool(
 - [ ] `tools/list` returns your tools with complete schemas
 - [ ] Errors return structured MCP errors, not HTTP 500s with HTML bodies
 - [ ] CORS headers set if browser clients will connect
+- [ ] `Origin` header validated on `/mcp` (spec MUST — DNS rebinding prevention)
+- [ ] `MCP-Protocol-Version` header honored (return 400 for unsupported versions)
+- [ ] `instructions` field set if tool-use needs hints
 - [ ] Health check endpoint separate from `/mcp` (hosts poll it)
 - [ ] Secrets from env vars, never hardcoded
-- [ ] If OAuth: DCR endpoint implemented — see `auth.md`
+- [ ] If OAuth: CIMD or DCR endpoint implemented — see `auth.md`

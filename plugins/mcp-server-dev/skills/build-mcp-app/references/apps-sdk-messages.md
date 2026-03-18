@@ -1,99 +1,120 @@
-# Apps SDK — Widget ↔ Host Message Protocol
+# ext-apps messaging — widget ↔ host ↔ server
 
-Widgets communicate with the MCP host through `window.parent.postMessage`. The apps SDK wraps this in helpers so you rarely touch the raw envelope, but knowing the shape helps when debugging.
-
----
-
-## Widget → host
-
-### `submit(result)`
-
-Ends the interaction. `result` is returned to Claude as the tool's output (serialized to JSON). The iframe is torn down after this fires.
-
-```js
-import { submit } from "@modelcontextprotocol/apps-sdk";
-submit({ id: "usr_abc123", action: "selected" });
-```
-
-Raw envelope:
-```json
-{ "type": "mcp:result", "result": { "id": "usr_abc123", "action": "selected" } }
-```
-
-### `callTool(name, args)`
-
-Ask the host to invoke **another tool on the same server** and return the result to the widget. Use for widgets that need to fetch more data after initial render (pagination, drill-down).
-
-```js
-import { callTool } from "@modelcontextprotocol/apps-sdk";
-const page2 = await callTool("list_items", { offset: 20, limit: 20 });
-```
-
-Round-trips through the host, so it's slower than embedding all data upfront. Only use when the full dataset is too large to ship in the initial payload.
-
-### `resize(height)`
-
-Tell the host the widget's content height so the iframe can be sized. The SDK auto-calls this on load via `ResizeObserver`; call manually only if your content height changes after an async operation.
+The `@modelcontextprotocol/ext-apps` package provides the `App` class (browser side) and `registerAppTool`/`registerAppResource` helpers (server side). Messaging is bidirectional and persistent.
 
 ---
 
-## Host → widget
+## Widget → Host
 
-### Initial data
+### `app.sendMessage({ role, content })`
 
-The widget's initial payload is **not** a message — it's baked into the HTML by the server (the `__DATA__` substitution pattern). This avoids a round-trip and works even if the message channel is slow to establish.
-
-### `onMessage(handler)`
-
-Subscribe to pushes from the server. Used by progress widgets and anything live-updating.
+Inject a visible message into the conversation. This is how user actions become conversation turns.
 
 ```js
-import { onMessage } from "@modelcontextprotocol/apps-sdk";
-onMessage((msg) => {
-  if (msg.type === "progress") updateBar(msg.percent);
+app.sendMessage({
+  role: "user",
+  content: [{ type: "text", text: "User selected order #1234" }],
 });
 ```
 
-Server side (TypeScript SDK), push via the notification stream keyed to the tool call's request context. The SDK exposes this as a `notify` callback on the tool handler:
+The message appears in chat and Claude responds to it. Use `role: "user"` — the widget speaks on the user's behalf.
+
+### `app.updateModelContext({ content })`
+
+Update Claude's context **silently** — no visible message. Use for state that informs but doesn't warrant a chat bubble.
+
+```js
+app.updateModelContext({
+  content: [{ type: "text", text: "Currently viewing: orders from last 30 days" }],
+});
+```
+
+### `app.callServerTool({ name, arguments })`
+
+Call a tool on your MCP server directly, bypassing Claude. Returns the tool result.
+
+```js
+const result = await app.callServerTool({
+  name: "fetch_order_details",
+  arguments: { orderId: "1234" },
+});
+```
+
+Use for data fetches that don't need Claude's reasoning — pagination, detail lookups, refreshes.
+
+---
+
+## Host → Widget
+
+### `app.ontoolresult = ({ content }) => {...}`
+
+Fires when the tool handler's return value is piped to the widget. This is the primary data-in path.
+
+```js
+app.ontoolresult = ({ content }) => {
+  const data = JSON.parse(content[0].text);
+  renderUI(data);
+};
+```
+
+**Set this BEFORE `await app.connect()`** — the result may arrive immediately after connection.
+
+### `app.ontoolinput = ({ arguments }) => {...}`
+
+Fires with the arguments Claude passed to the tool. Useful if the widget needs to know what was asked for (e.g., highlight the search term).
+
+---
+
+## Server → Widget (progress)
+
+For long-running operations, emit progress notifications. The client sends a `progressToken` in the request's `_meta`; the server emits against it.
 
 ```typescript
-server.tool("long_job", "...", schema, async (args, { notify }) => {
-  for (let i = 0; i <= 100; i += 10) {
-    await step();
-    notify({ type: "progress", percent: i, label: `Step ${i / 10}/10` });
+// In the tool handler
+async ({ query }, extra) => {
+  const token = extra._meta?.progressToken;
+  for (let i = 0; i < steps.length; i++) {
+    if (token !== undefined) {
+      await extra.sendNotification({
+        method: "notifications/progress",
+        params: { progressToken: token, progress: i, total: steps.length, message: steps[i].name },
+      });
+    }
+    await steps[i].run();
   }
-  return { content: [...] };
-});
+  return { content: [{ type: "text", text: "Complete" }] };
+}
 ```
+
+No `{ notify }` destructure — `extra` is `RequestHandlerExtra`; progress goes through `sendNotification`.
 
 ---
 
 ## Lifecycle
 
-```
-1. Claude calls tool
-2. Server returns content with embedded resource (mimeType: text/html+skybridge)
-3. Host renders resource text in sandboxed iframe
-4. Widget hydrates from inline __DATA__
-5. (optional) Widget ↔ host messages: callTool, progress pushes
-6. Widget calls submit(result)
-7. Host tears down iframe, injects result into conversation
-8. Claude continues with the result
-```
+1. Claude calls a tool with `_meta.ui.resourceUri` declared
+2. Host fetches the resource (your HTML) and renders it in an iframe
+3. Widget script runs, sets handlers, calls `await app.connect()`
+4. Host pipes the tool's return value → `ontoolresult` fires
+5. Widget renders, user interacts
+6. Widget calls `sendMessage` / `updateModelContext` / `callServerTool` as needed
+7. Widget persists until conversation context moves on — subsequent calls to the same tool reuse the iframe and fire `ontoolresult` again
 
-If step 6 never happens (user closes the widget, host times out), the tool call resolves with a cancellation result. Your tool description should account for this — "Returns the selected ID, or null if the user cancels."
+There's no explicit "submit and close" — the widget is a long-lived surface.
 
 ---
 
 ## CSP gotchas
 
-The iframe sandbox enforces a strict Content Security Policy. Common failures:
+The iframe runs under a restrictive Content-Security-Policy:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Widget renders but JS doesn't run | Inline script blocked | Use `<script type="module">` with SDK import; avoid inline event handlers in HTML attributes |
-| `fetch()` fails silently | Cross-origin blocked | Route through `callTool()` instead |
-| External CSS doesn't load | `style-src` restriction | Inline your styles in a `<style>` tag |
+| Widget renders but JS doesn't run | Inline event handlers blocked | Use `addEventListener` — never `onclick="..."` in HTML |
+| `eval` / `new Function` errors | Script-src restriction | Don't use them; use JSON.parse for data |
+| External scripts fail | CDN not allowlisted | `esm.sh` is safe; avoid others |
+| `fetch()` to your API fails | Cross-origin blocked | Route through `app.callServerTool()` instead |
+| External CSS doesn't load | `style-src` restriction | Inline styles in a `<style>` tag |
 | Fonts don't load | `font-src` restriction | Use system fonts (`font: 14px system-ui`) |
 
 When in doubt, open the iframe's devtools console — CSP violations log there.

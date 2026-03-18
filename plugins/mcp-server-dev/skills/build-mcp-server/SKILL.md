@@ -38,14 +38,16 @@ This determines the tool-design pattern — see Phase 3.
 - **Under ~15 actions** → one tool per action
 - **Dozens to hundreds of actions** (e.g. wrapping a large API surface) → search + execute pattern
 
-### 4. Does it need interactive UI in the chat?
+### 4. Does a tool need mid-call user input or rich display?
 
-Forms, pickers, dashboards, confirmation dialogs rendered inline in the conversation → **MCP app** (adds UI resources on top of a standard server).
+- **Simple structured input** (pick from list, enter a value, confirm) → **Elicitation** — spec-native, zero UI code. *Host support is rolling out* (Claude Code ≥2.1.76) — always pair with a capability check and fallback. See `references/elicitation.md`.
+- **Rich/visual UI** (charts, custom pickers with search, live dashboards) → **MCP app widgets** — iframe-based, needs `@modelcontextprotocol/ext-apps`. See `build-mcp-app` skill.
+- **Neither** → plain tool returning text/JSON.
 
 ### 5. What auth does the upstream service use?
 
 - None / API key → straightforward
-- OAuth 2.0 → you'll need a remote server with DCR (Dynamic Client Registration) or CIMD support; see `references/auth.md`
+- OAuth 2.0 → you'll need a remote server with CIMD (preferred) or DCR support; see `references/auth.md`
 
 ---
 
@@ -67,11 +69,19 @@ A hosted service speaking MCP over streamable HTTP. This is the **recommended pa
 
 → Scaffold with `references/remote-http-scaffold.md`
 
+### Elicitation (structured input, no UI build)
+
+If a tool just needs the user to confirm, pick an option, or fill a short form, **elicitation** does it with zero UI code. The server sends a flat JSON schema; the host renders a native form. Spec-native, no extra packages.
+
+**Caveat:** Host support is new (Claude Code shipped it in v2.1.76; Desktop unconfirmed). The SDK throws if the client doesn't advertise the capability. Always check `clientCapabilities.elicitation` first and have a fallback — see `references/elicitation.md` for the canonical pattern. This is the right spec-correct approach; host coverage will catch up.
+
+Escalate to `build-mcp-app` widgets when you need: nested/complex data, scrollable/searchable lists, visual previews, live updates.
+
 ### MCP app (remote HTTP + interactive UI)
 
-Same as above, plus **UI resources** — interactive widgets rendered in chat. Forms, file pickers, rich previews, confirmation dialogs. Built once, renders in Claude *and* ChatGPT.
+Same as above, plus **UI resources** — interactive widgets rendered in chat. Rich pickers with search, charts, live dashboards, visual previews. Built once, renders in Claude *and* ChatGPT.
 
-**Choose this when** one or more tools benefit from structured user input or rich output that plain text can't handle.
+**Choose this when** elicitation's flat-form constraints don't fit — you need custom layout, large searchable lists, visual content, or live updates.
 
 Usually remote, but can be shipped as MCPB if the UI needs to drive a local app.
 
@@ -137,7 +147,7 @@ Recommend one of these two. Others exist but these have the best MCP-spec covera
 | Framework | Language | Use when |
 |---|---|---|
 | **Official TypeScript SDK** (`@modelcontextprotocol/sdk`) | TS/JS | Default choice. Best spec coverage, first to get new features. |
-| **FastMCP 2.0** | Python | User prefers Python, or wrapping a Python library. Decorator-based, very low boilerplate. |
+| **FastMCP 3.x** (`fastmcp` on PyPI) | Python | User prefers Python, or wrapping a Python library. Decorator-based, very low boilerplate. This is jlowin's package — not the frozen FastMCP 1.0 bundled in the official `mcp` SDK. |
 
 If the user already has a language/stack in mind, go with it — both produce identical wire protocol.
 
@@ -153,6 +163,21 @@ Once you've settled the four decisions (deployment model, tool pattern, framewor
 4. **Local stdio prototype** → Scaffold inline (simplest case), flag the MCPB upgrade path.
 
 When handing off, restate the design brief in one paragraph so the next skill doesn't re-ask.
+
+---
+
+## Beyond tools — the other primitives
+
+Tools are one of three server primitives. Most servers start with tools and never need the others, but knowing they exist prevents reinventing wheels:
+
+| Primitive | Who triggers it | Use when |
+|---|---|---|
+| **Resources** | Host app (not Claude) | Exposing docs/files/data as browsable context |
+| **Prompts** | User (slash command) | Canned workflows ("/summarize-thread") |
+| **Elicitation** | Server, mid-tool | Asking user for input without building UI |
+| **Sampling** | Server, mid-tool | Need LLM inference in your tool logic |
+
+→ `references/resources-and-prompts.md`, `references/elicitation.md`, `references/server-capabilities.md`
 
 ---
 
@@ -174,4 +199,7 @@ When handing off, restate the design brief in one paragraph so the next skill do
 
 - `references/remote-http-scaffold.md` — minimal remote server in TS SDK and FastMCP
 - `references/tool-design.md` — writing tool descriptions and schemas Claude understands well
-- `references/auth.md` — OAuth, DCR, CIMD, token storage patterns
+- `references/auth.md` — OAuth, CIMD, DCR, token storage patterns
+- `references/resources-and-prompts.md` — the two non-tool primitives
+- `references/elicitation.md` — spec-native user input mid-tool (capability check + fallback)
+- `references/server-capabilities.md` — instructions, sampling, roots, logging, progress, cancellation

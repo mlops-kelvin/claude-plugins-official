@@ -28,6 +28,24 @@ If none apply, skip the widget. Text is faster to build and faster for the user.
 
 ---
 
+## Widgets vs Elicitation — route correctly
+
+Before building a widget, check if **elicitation** covers it. Elicitation is spec-native, zero UI code, works in any compliant host.
+
+| Need | Elicitation | Widget |
+|---|---|---|
+| Confirm yes/no | ✅ | overkill |
+| Pick from short enum | ✅ | overkill |
+| Fill a flat form (name, email, date) | ✅ | overkill |
+| Pick from a large/searchable list | ❌ (no scroll/search) | ✅ |
+| Visual preview before choosing | ❌ | ✅ |
+| Chart / map / diff view | ❌ | ✅ |
+| Live-updating progress | ❌ | ✅ |
+
+If elicitation covers it, use it. See `../build-mcp-server/references/elicitation.md`.
+
+---
+
 ## Architecture: two deployment shapes
 
 ### Remote MCP app (most common)
@@ -59,117 +77,178 @@ For MCPB packaging mechanics, defer to the **`build-mcpb`** skill. Everything be
 
 ## How widgets attach to tools
 
-A tool declares a widget by returning an **embedded resource** in its result alongside (or instead of) text content. The resource's `mimeType` tells the host to render it, and the `text` field carries the widget's HTML.
+A widget-enabled tool has **two separate registrations**:
+
+1. **The tool** declares a UI resource via `_meta.ui.resourceUri`. Its handler returns plain text/JSON — NOT the HTML.
+2. **The resource** is registered separately and serves the HTML.
+
+When Claude calls the tool, the host sees `_meta.ui.resourceUri`, fetches that resource, renders it in an iframe, and pipes the tool's return value into the iframe via the `ontoolresult` event.
 
 ```typescript
-server.tool(
-  "pick_contact",
-  "Open an interactive contact picker. The user selects one contact; its ID is returned.",
-  {
-    filter: z.string().optional().describe("Optional name/email prefix filter"),
-  },
-  async ({ filter }) => {
-    const contacts = await listContacts(filter);
-    return {
-      content: [
-        {
-          type: "resource",
-          resource: {
-            uri: "ui://widgets/contact-picker",
-            mimeType: "text/html+skybridge",
-            text: renderContactPicker(contacts),
-          },
-        },
-      ],
-    };
-  },
-);
-```
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE }
+  from "@modelcontextprotocol/ext-apps/server";
+import { z } from "zod";
 
-The host renders the resource in a sandboxed iframe. The widget posts a message back when the user picks something; the host injects that result into the conversation so Claude can continue.
+const server = new McpServer({ name: "contacts", version: "1.0.0" });
 
----
+// 1. The tool — returns DATA, declares which UI to show
+registerAppTool(server, "pick_contact", {
+  description: "Open an interactive contact picker",
+  inputSchema: { filter: z.string().optional() },
+  _meta: { ui: { resourceUri: "ui://widgets/contact-picker.html" } },
+}, async ({ filter }) => {
+  const contacts = await db.contacts.search(filter);
+  // Plain JSON — the widget receives this via ontoolresult
+  return { content: [{ type: "text", text: JSON.stringify(contacts) }] };
+});
 
-## Widget runtime contract
-
-Widgets run in a sandboxed iframe. They talk to the host via `window.parent.postMessage` with a small set of message types. The exact envelope is host-defined — the MCP apps SDK wraps it so you don't hand-roll `postMessage`.
-
-**What widgets can do:**
-- Render arbitrary HTML/CSS/JS (sandboxed — no same-origin access to the host page)
-- Receive an initial `data` payload from the tool result
-- Post a **result** back (ends the interaction, value flows to Claude)
-- Post **progress** updates (for long-running widgets)
-- Request the host **call another tool** on the same server
-
-**What widgets cannot do:**
-- Access the host page's DOM, cookies, or storage
-- Make network calls to origins other than your MCP server (CSP-restricted)
-- Persist state across renders (each tool call is a fresh iframe)
-
-Keep widgets **small and single-purpose**. A picker picks. A form submits. Don't build a whole sub-app inside the iframe — split it into multiple tools with focused widgets.
-
----
-
-## Scaffold: minimal form widget
-
-**Tool (TypeScript SDK):**
-
-```typescript
-import { renderWidget } from "./widgets";
-
-server.tool(
-  "create_ticket",
-  "Open a form to create a support ticket. User fills in title, priority, and description.",
+// 2. The resource — serves the HTML
+registerAppResource(
+  server,
+  "Contact Picker",
+  "ui://widgets/contact-picker.html",
   {},
   async () => ({
-    content: [
-      {
-        type: "resource",
-        resource: {
-          uri: "ui://widgets/create-ticket",
-          mimeType: "text/html+skybridge",
-          text: renderWidget("create-ticket", {
-            priorities: ["low", "medium", "high", "urgent"],
-          }),
-        },
-      },
-    ],
+    contents: [{
+      uri: "ui://widgets/contact-picker.html",
+      mimeType: RESOURCE_MIME_TYPE,
+      text: pickerHtml,  // your HTML string
+    }],
   }),
 );
 ```
 
-**Widget template (`widgets/create-ticket.html`):**
+The URI scheme `ui://` is convention. The mime type MUST be `RESOURCE_MIME_TYPE` (`"text/html;profile=mcp-app"`) — this is how the host knows to render it as an interactive iframe, not just display the source.
+
+---
+
+## Widget runtime — the `App` class
+
+Inside the iframe, your script talks to the host via the `App` class from `@modelcontextprotocol/ext-apps`. This is a **persistent bidirectional connection** — the widget stays alive as long as the conversation is active, receiving new tool results and sending user actions.
+
+```html
+<script type="module">
+  import { App } from "https://esm.sh/@modelcontextprotocol/ext-apps@1.2.2";
+
+  const app = new App({ name: "ContactPicker", version: "1.0.0" }, {});
+
+  // Set handlers BEFORE connecting
+  app.ontoolresult = ({ content }) => {
+    const contacts = JSON.parse(content[0].text);
+    render(contacts);
+  };
+
+  await app.connect();
+
+  // Later, when the user clicks something:
+  function onPick(contact) {
+    app.sendMessage({
+      role: "user",
+      content: [{ type: "text", text: `Selected contact: ${contact.id}` }],
+    });
+  }
+</script>
+```
+
+| Method | Direction | Use for |
+|---|---|---|
+| `app.ontoolresult = fn` | Host → widget | Receive the tool's return value |
+| `app.ontoolinput = fn` | Host → widget | Receive the tool's input args (what Claude passed) |
+| `app.sendMessage({...})` | Widget → host | Inject a message into the conversation |
+| `app.updateModelContext({...})` | Widget → host | Update context silently (no visible message) |
+| `app.callServerTool({name, arguments})` | Widget → server | Call another tool on your server |
+
+`sendMessage` is the typical "user picked something, tell Claude" path. `updateModelContext` is for state that Claude should know about but shouldn't clutter the chat.
+
+**What widgets cannot do:**
+- Access the host page's DOM, cookies, or storage
+- Make network calls to arbitrary origins (CSP-restricted — route through `callServerTool`)
+
+Keep widgets **small and single-purpose**. A picker picks. A chart displays. Don't build a whole sub-app inside the iframe — split it into multiple tools with focused widgets.
+
+---
+
+## Scaffold: minimal picker widget
+
+**Install:**
+
+```bash
+npm install @modelcontextprotocol/sdk @modelcontextprotocol/ext-apps zod
+```
+
+**Server (`src/server.ts`):**
+
+```typescript
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { registerAppTool, registerAppResource, RESOURCE_MIME_TYPE }
+  from "@modelcontextprotocol/ext-apps/server";
+import { readFileSync } from "node:fs";
+import { z } from "zod";
+
+const server = new McpServer({ name: "contact-picker", version: "1.0.0" });
+
+const pickerHtml = readFileSync("./widgets/picker.html", "utf8");
+
+registerAppTool(server, "pick_contact", {
+  description: "Open an interactive contact picker. User selects one contact.",
+  inputSchema: { filter: z.string().optional().describe("Name/email prefix filter") },
+  _meta: { ui: { resourceUri: "ui://widgets/picker.html" } },
+}, async ({ filter }) => {
+  const contacts = await db.contacts.search(filter ?? "");
+  return { content: [{ type: "text", text: JSON.stringify(contacts) }] };
+});
+
+registerAppResource(server, "Contact Picker", "ui://widgets/picker.html", {},
+  async () => ({
+    contents: [{ uri: "ui://widgets/picker.html", mimeType: RESOURCE_MIME_TYPE, text: pickerHtml }],
+  }),
+);
+
+await server.connect(new StdioServerTransport());
+```
+
+**Widget (`widgets/picker.html`):**
 
 ```html
 <!doctype html>
 <meta charset="utf-8" />
 <style>
-  body { font: 14px system-ui; margin: 12px; }
-  label { display: block; margin-top: 8px; font-weight: 500; }
-  input, select, textarea { width: 100%; padding: 6px; margin-top: 2px; }
-  button { margin-top: 12px; padding: 8px 16px; }
+  body { font: 14px system-ui; margin: 0; }
+  ul { list-style: none; padding: 0; margin: 0; max-height: 300px; overflow-y: auto; }
+  li { padding: 10px 14px; cursor: pointer; border-bottom: 1px solid #eee; }
+  li:hover { background: #f5f5f5; }
+  .sub { color: #666; font-size: 12px; }
 </style>
-<form id="f">
-  <label>Title <input name="title" required /></label>
-  <label>Priority
-    <select name="priority">
-      {{#each priorities}}<option>{{this}}</option>{{/each}}
-    </select>
-  </label>
-  <label>Description <textarea name="description" rows="4"></textarea></label>
-  <button type="submit">Create</button>
-</form>
+<ul id="list"></ul>
 <script type="module">
-  import { submit } from "https://esm.sh/@modelcontextprotocol/apps-sdk";
-  document.getElementById("f").addEventListener("submit", (e) => {
-    e.preventDefault();
-    const data = Object.fromEntries(new FormData(e.target));
-    submit(data);  // → flows back to Claude as the tool's result
-  });
+  import { App } from "https://esm.sh/@modelcontextprotocol/ext-apps@1.2.2";
+
+  const app = new App({ name: "ContactPicker", version: "1.0.0" }, {});
+  const ul = document.getElementById("list");
+
+  app.ontoolresult = ({ content }) => {
+    const contacts = JSON.parse(content[0].text);
+    ul.innerHTML = "";
+    for (const c of contacts) {
+      const li = document.createElement("li");
+      li.innerHTML = `<div>${c.name}</div><div class="sub">${c.email}</div>`;
+      li.addEventListener("click", () => {
+        app.sendMessage({
+          role: "user",
+          content: [{ type: "text", text: `Selected contact: ${c.id} (${c.name})` }],
+        });
+      });
+      ul.append(li);
+    }
+  };
+
+  await app.connect();
 </script>
 ```
 
-`renderWidget` is a ~10-line template function — see `references/widget-templates.md`.
+See `references/widget-templates.md` for more widget shapes.
 
 ---
 
@@ -179,7 +258,7 @@ server.tool(
 
 **Tool description must mention the widget.** Claude only sees the tool description when deciding what to call. "Opens an interactive picker" in the description is what makes Claude reach for it instead of guessing an ID.
 
-**Widgets are optional at runtime.** Hosts that don't support the apps surface fall back to showing the resource as a link or raw text. Your tool should still return something sensible in `content[].text` alongside the widget for that case.
+**Widgets are optional at runtime.** Hosts that don't support the apps surface simply ignore `_meta.ui` and render the tool's text content normally. Since your tool handler already returns meaningful text/JSON (the widget's data), degradation is automatic — Claude sees the data directly instead of via the widget.
 
 **Don't block on widget results for read-only tools.** A widget that just *displays* data (chart, preview) shouldn't require a user action to complete. Return the display widget *and* a text summary in the same result so Claude can continue reasoning without waiting.
 
@@ -187,7 +266,7 @@ server.tool(
 
 ## Testing
 
-- **Local:** point Claude desktop's MCP config at `http://localhost:3000/mcp`, trigger the tool, check the widget renders and submits.
+- **Local:** point Claude desktop's MCP config at your server, trigger the tool, check the widget renders and `sendMessage` flows back into the chat.
 - **Host fallback:** disable the apps surface (or use a host without it) and confirm the tool degrades gracefully.
 - **CSP:** open browser devtools on the iframe — CSP violations are the #1 reason widgets silently fail.
 
@@ -195,5 +274,5 @@ server.tool(
 
 ## Reference files
 
-- `references/widget-templates.md` — reusable HTML scaffolds for form / picker / confirm / progress
-- `references/apps-sdk-messages.md` — the `postMessage` protocol between widget and host
+- `references/widget-templates.md` — reusable HTML scaffolds for picker / confirm / progress / display
+- `references/apps-sdk-messages.md` — the `App` class API: widget ↔ host ↔ server messaging

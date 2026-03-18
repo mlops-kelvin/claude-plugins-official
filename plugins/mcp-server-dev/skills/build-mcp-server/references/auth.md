@@ -17,32 +17,32 @@ if (!apiKey) throw new Error("UPSTREAM_API_KEY not set");
 
 Works for local stdio, MCPB, and remote servers alike. If this is all you need, stop here.
 
-### Tier 2: OAuth 2.0 via Dynamic Client Registration (DCR)
+### Tier 2: OAuth 2.0 via CIMD (preferred per spec 2025-11-25)
 
-The MCP host (Claude desktop, Claude Code, etc.) discovers your server's OAuth metadata, **registers itself as a client dynamically**, runs the auth-code flow, and stores the token. Your server never sees credentials — it just receives bearer tokens on each request.
+**Client ID Metadata Document.** The MCP host publishes its client metadata at an HTTPS URL and uses that URL *as* its `client_id`. Your authorization server fetches the document, validates it, and proceeds with the auth-code flow. No registration endpoint, no stored client records.
 
-This is the **recommended path** for any remote server wrapping an OAuth-protected API.
+Spec 2025-11-25 promoted CIMD to SHOULD (preferred). Advertise support via `client_id_metadata_document_supported: true` in your OAuth AS metadata.
 
 **Server responsibilities:**
 
-1. Serve OAuth Authorization Server Metadata (RFC 8414) at `/.well-known/oauth-authorization-server`
+1. Serve OAuth Authorization Server Metadata (RFC 8414) at `/.well-known/oauth-authorization-server` with `client_id_metadata_document_supported: true`
 2. Serve an MCP-protected-resource metadata document pointing at (1)
-3. Implement (or proxy to) a DCR endpoint that hands out client IDs
+3. At authorize time: fetch `client_id` as an HTTPS URL, validate the returned client metadata, proceed
 4. Validate bearer tokens on incoming `/mcp` requests
 
-Most of this is boilerplate — the SDK has helpers. The real decision is whether you **proxy** to the upstream's OAuth (if they support DCR) or run your own **shim** authorization server that exchanges your tokens for upstream tokens.
-
 ```
-┌─────────┐   DCR + auth code   ┌──────────────┐   upstream OAuth   ┌──────────┐
-│ MCP host│ ──────────────────> │ Your MCP srv │ ─────────────────> │ Upstream │
-└─────────┘ <── bearer token ── └──────────────┘ <── access token ──└──────────┘
+┌─────────┐  client_id=https://...  ┌──────────────┐   upstream OAuth   ┌──────────┐
+│ MCP host│ ──────────────────────> │ Your MCP srv │ ─────────────────> │ Upstream │
+└─────────┘ <─── bearer token ───── └──────────────┘ <── access token ──└──────────┘
 ```
 
-### Tier 3: CIMD (Client ID Metadata Document)
+### Tier 3: OAuth 2.0 via Dynamic Client Registration (DCR)
 
-An alternative to DCR for ecosystems that don't want dynamic registration. The host publishes its client metadata at a well-known URL; your server fetches it, validates it, and issues a client credential. Lower friction than DCR for the host, slightly more work for you.
+**Backward-compat fallback** — spec 2025-11-25 demoted DCR to MAY. The host discovers your `registration_endpoint`, POSTs its metadata to register itself as a client, gets back a `client_id`, then runs the auth-code flow.
 
-Use CIMD when targeting hosts that advertise CIMD support in their client metadata. Otherwise default to DCR — it's more broadly implemented.
+Implement DCR if you need to support hosts that haven't moved to CIMD yet. Same server responsibilities as CIMD, but instead of fetching the `client_id` URL you run a registration endpoint that stores client records.
+
+**Client priority order:** pre-registered → CIMD (if AS advertises `client_id_metadata_document_supported`) → DCR (if AS has `registration_endpoint`) → prompt user.
 
 ---
 
@@ -71,3 +71,22 @@ If OAuth is required, lean hard toward remote HTTP. If you *must* ship local + O
 | Remote, stateless | Nowhere — host sends bearer each request |
 | Remote, stateful | Session store keyed by MCP session ID (Redis, etc.) |
 | MCPB / local | OS keychain (`keytar` on Node, `keyring` on Python). **Never plaintext on disk.** |
+
+---
+
+## Token audience validation (spec MUST)
+
+Validating "is this a valid bearer token" isn't enough. The spec requires validating "was this token minted *for this server*" — RFC 8707 audience. A token issued for `api.other-service.com` must be rejected even if the signature checks out.
+
+**Token passthrough is explicitly forbidden.** Don't accept a token, then forward it upstream. If your server needs to call another service, exchange the token or use its own credentials.
+
+---
+
+## SDK helpers — don't hand-roll
+
+`@modelcontextprotocol/sdk/server/auth` ships:
+- `mcpAuthRouter()` — Express router for the full OAuth AS surface (metadata, authorize, token)
+- `bearerAuth` — middleware that validates bearer tokens against your verifier
+- `proxyProvider` — forward auth to an upstream IdP
+
+If you're wiring auth from scratch, check these first.

@@ -16,15 +16,14 @@ MCPB is a local MCP server **packaged with its runtime**. The user installs one 
 
 ```
 my-server.mcpb              (zip archive)
-├── manifest.json           ← identity, entry point, permissions, config schema
+├── manifest.json           ← identity, entry point, config schema, compatibility
 ├── server/                 ← your MCP server code
 │   ├── index.js
 │   └── node_modules/       ← bundled dependencies (or vendored)
-├── runtime/                ← optional: pinned Node/Python if not using host's
 └── icon.png
 ```
 
-The host reads `manifest.json`, launches the entry point as a **stdio** MCP server, and pipes messages. From your code's perspective it's identical to a local stdio server — the only difference is packaging.
+The host reads `manifest.json`, launches `server.mcp_config.command` as a **stdio** MCP server, and pipes messages. From your code's perspective it's identical to a local stdio server — the only difference is packaging.
 
 ---
 
@@ -32,32 +31,44 @@ The host reads `manifest.json`, launches the entry point as a **stdio** MCP serv
 
 ```json
 {
+  "$schema": "https://raw.githubusercontent.com/anthropics/mcpb/main/schemas/mcpb-manifest-v0.4.schema.json",
+  "manifest_version": "0.4",
   "name": "local-files",
   "version": "0.1.0",
   "description": "Read, search, and watch files on the local filesystem.",
-  "entry": {
+  "author": { "name": "Your Name" },
+  "server": {
     "type": "node",
-    "main": "server/index.js"
-  },
-  "permissions": {
-    "filesystem": { "read": true, "write": false },
-    "network": false
-  },
-  "config": {
-    "rootDir": {
-      "type": "string",
-      "description": "Directory to expose. Defaults to ~/Documents.",
-      "default": "~/Documents"
+    "entry_point": "server/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.js"],
+      "env": {
+        "ROOT_DIR": "${user_config.rootDir}"
+      }
     }
+  },
+  "user_config": {
+    "rootDir": {
+      "type": "directory",
+      "title": "Root directory",
+      "description": "Directory to expose. Defaults to ~/Documents.",
+      "default": "${HOME}/Documents",
+      "required": true
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=1.0.0",
+    "platforms": ["darwin", "win32", "linux"]
   }
 }
 ```
 
-**`entry.type`** — `node`, `python`, or `binary`. Determines which bundled/host runtime launches `main`.
+**`server.type`** — `node`, `python`, or `binary`. Informational; the actual launch comes from `mcp_config`.
 
-**`permissions`** — declared upfront and shown to the user at install. Request the minimum. Broad permissions (`filesystem.write: true`, `network: true`) trigger scarier consent UI and more scrutiny.
+**`server.mcp_config`** — the literal command/args/env to spawn. Use `${__dirname}` for bundle-relative paths and `${user_config.<key>}` to substitute install-time config. **There's no auto-prefix** — the env var names your server reads are exactly what you put in `env`.
 
-**`config`** — user-settable values surfaced in the host's settings UI. Your server reads them from env vars (`MCPB_CONFIG_<KEY>`).
+**`user_config`** — install-time settings surfaced in the host's UI. `type: "directory"` renders a native folder picker. `sensitive: true` stores in OS keychain. See `references/manifest-schema.md` for all fields.
 
 ---
 
@@ -73,15 +84,18 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-const ROOT = (process.env.MCPB_CONFIG_ROOTDIR ?? "~/Documents")
-  .replace(/^~/, homedir());
+// ROOT_DIR comes from what you put in manifest's server.mcp_config.env — no auto-prefix
+const ROOT = (process.env.ROOT_DIR ?? join(homedir(), "Documents"));
 
 const server = new McpServer({ name: "local-files", version: "0.1.0" });
 
-server.tool(
+server.registerTool(
   "list_files",
-  "List files in a directory under the configured root.",
-  { path: z.string().default(".") },
+  {
+    description: "List files in a directory under the configured root.",
+    inputSchema: { path: z.string().default(".") },
+    annotations: { readOnlyHint: true },
+  },
   async ({ path }) => {
     const entries = await readdir(join(ROOT, path), { withFileTypes: true });
     const list = entries.map(e => ({ name: e.name, dir: e.isDirectory() }));
@@ -89,10 +103,13 @@ server.tool(
   },
 );
 
-server.tool(
+server.registerTool(
   "read_file",
-  "Read a file's contents. Path is relative to the configured root.",
-  { path: z.string() },
+  {
+    description: "Read a file's contents. Path is relative to the configured root.",
+    inputSchema: { path: z.string() },
+    annotations: { readOnlyHint: true },
+  },
   async ({ path }) => {
     const text = await readFile(join(ROOT, path), "utf8");
     return { content: [{ type: "text", text }] };
@@ -103,7 +120,9 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 ```
 
-**Sandboxing is your job.** The manifest permissions gate what the *host* allows the process to do, but don't rely on that alone — validate paths, refuse to escape `ROOT`, etc. See `references/local-security.md`.
+**Sandboxing is entirely your job.** There is no manifest-level sandbox — the process runs with full user privileges. Validate paths, refuse to escape `ROOT`, allowlist spawns. See `references/local-security.md`.
+
+Before hardcoding `ROOT` from a config env var, check if the host supports `roots/list` — the spec-native way to get user-approved directories. See `references/local-security.md` for the pattern.
 
 ---
 
@@ -115,35 +134,29 @@ await server.connect(transport);
 npm install
 npx esbuild src/index.ts --bundle --platform=node --outfile=server/index.js
 # or: copy node_modules wholesale if native deps resist bundling
-npx @modelcontextprotocol/mcpb pack . -o my-server.mcpb
+npx @anthropic-ai/mcpb pack
 ```
 
-`mcpb pack` zips the directory, validates `manifest.json`, and optionally pulls a pinned Node runtime into `runtime/`.
+`mcpb pack` zips the directory and validates `manifest.json` against the schema.
 
 ### Python
 
 ```bash
 pip install -t server/vendor -r requirements.txt
-npx @modelcontextprotocol/mcpb pack . -o my-server.mcpb --runtime python3.12
+npx @anthropic-ai/mcpb pack
 ```
 
-Vendor dependencies into a subdirectory and prepend it to `sys.path` in your entry script. Native extensions (numpy, etc.) must be built for each target platform — `mcpb pack --multiarch` cross-builds, but it's slow; avoid native deps if you can.
+Vendor dependencies into a subdirectory and prepend it to `sys.path` in your entry script. Native extensions (numpy, etc.) must be built for each target platform — avoid native deps if you can.
 
 ---
 
-## Permissions: request the minimum
+## MCPB has no sandbox — security is on you
 
-The install prompt shows what you ask for. Every extra permission is friction.
+Unlike mobile app stores, MCPB does NOT enforce permissions. The manifest has no `permissions` block — the server runs with full user privileges. `references/local-security.md` is mandatory reading, not optional. Every path must be validated, every spawn must be allowlisted, because nothing stops you at the platform level.
 
-| Need | Request |
-|---|---|
-| Read files in one directory | `filesystem.read: true` + enforce root in code |
-| Write files | `filesystem.write: true` — justify in description |
-| Call a local HTTP service | `network: { "allow": ["localhost:*"] }` |
-| Call the internet | `network: true` — but ask yourself why this isn't a remote server |
-| Spawn processes | `process.spawn: true` — highest scrutiny |
+If you came here expecting filesystem/network scoping from the manifest: it doesn't exist. Build it yourself in tool handlers.
 
-If you find yourself requesting `network: true` to hit a cloud API, stop — that's a remote server wearing an MCPB costume. The user gains nothing from running it locally.
+If your server's only job is hitting a cloud API, stop — that's a remote server wearing an MCPB costume. The user gains nothing from running it locally, and you're taking on local-security burden for no reason.
 
 ---
 
@@ -158,15 +171,20 @@ Widget authoring is covered in the **`build-mcp-app`** skill; it works the same 
 ## Testing
 
 ```bash
+# Interactive manifest creation (first time)
+npx @anthropic-ai/mcpb init
+
 # Run the server directly over stdio, poke it with the inspector
 npx @modelcontextprotocol/inspector node server/index.js
 
-# Pack and validate
-npx @modelcontextprotocol/mcpb pack . -o test.mcpb
-npx @modelcontextprotocol/mcpb validate test.mcpb
+# Validate manifest against schema, then pack
+npx @anthropic-ai/mcpb validate
+npx @anthropic-ai/mcpb pack
 
-# Install into Claude desktop for end-to-end
-npx @modelcontextprotocol/mcpb install test.mcpb
+# Sign for distribution
+npx @anthropic-ai/mcpb sign dist/local-files.mcpb
+
+# Install: drag the .mcpb file onto Claude Desktop
 ```
 
 Test on a machine **without** your dev toolchain before shipping. "Works on my machine" failures in MCPB almost always trace to a dependency that wasn't actually bundled.
