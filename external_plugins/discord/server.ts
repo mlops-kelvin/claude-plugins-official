@@ -96,6 +96,10 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Bot user IDs (snowflakes) whose messages should be delivered instead of ignored.
+   *  Default: [] (all bot messages dropped). Only listed IDs are accepted --
+   *  prevents infinite loops while enabling multi-agent coordination. */
+  allowBotIds?: string[]
 }
 
 function defaultAccess(): Access {
@@ -636,7 +640,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 await mcp.connect(new StdioServerTransport())
 
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  if (msg.author.bot) {
+    // Allow messages from explicitly allowlisted bot IDs (for multi-agent coordination).
+    // All other bot messages are dropped to prevent infinite loops.
+    const access = loadAccess()
+    const allowed = access.allowBotIds ?? []
+    if (!allowed.includes(msg.author.id)) return
+  }
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
